@@ -103,6 +103,7 @@ pub async fn run(
 	if let Some(error) = parse_error {
 		warn!("Using default log level: {}", error);
 	}
+	// panic!("{}", cfg.avail_path);
 
 	let db = init_db(&cfg.avail_path).context("Cannot initialize database")?;
 
@@ -143,7 +144,6 @@ pub async fn run(
 			}
 		}
 	});
-
 	let (network_client, network_event_loop) = super::network::init(
 		(&cfg).into(),
 		network_stats_sender,
@@ -201,6 +201,7 @@ pub async fn run(
 			// hang in there, until someone dials us
 			.await
 			.context("Connection is not established")?;
+
 		vec![node]
 	} else {
 		bootstrap_nodes
@@ -218,7 +219,6 @@ pub async fn run(
 	let public_params_hash = hex::encode(sp_core::blake2_128(&raw_pp));
 	let public_params_len = hex::encode(raw_pp).len();
 	trace!("Public params ({public_params_len}): hash: {public_params_hash}");
-
 	let last_full_node_ws = super::data::get_last_full_node_ws_from_db(db.clone())?;
 
 	let (rpc_client, node) = super::rpc::connect_to_the_full_node(
@@ -337,5 +337,6 @@ pub async fn run(
 		state.clone(),
 		lc_channels,
 	));
+
 	return Ok((state.clone(), db.clone()));
 }

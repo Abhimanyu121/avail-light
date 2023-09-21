@@ -1,3 +1,5 @@
+use std::fmt::Error;
+
 use anyhow::{Context, Result};
 use event_loop::EventLoop;
 use futures::future::Either;
@@ -5,7 +7,7 @@ use libp2p::{
 	autonat::{self, Behaviour as AutoNat},
 	core::{muxing::StreamMuxerBox, transport::OrTransport, upgrade::Version, ConnectedPoint},
 	dcutr::Behaviour as Dcutr,
-	dns::TokioDnsConfig,
+	dns::{ResolverConfig, ResolverOpts, TokioDnsConfig},
 	identify::{self, Behaviour as Identify},
 	identity,
 	kad::{Kademlia, KademliaCaching, KademliaConfig},
@@ -81,6 +83,7 @@ pub fn init(
 			.upgrade(Version::V1Lazy)
 			.authenticate(NoiseConfig::new(&id_keys)?)
 			.multiplex(libp2p::yamux::Config::default());
+
 		// relay transport only handles listening and dialing on relayed [`Multiaddr`]
 		// and depends on other transport to do the actual transmission of data, we have to combine the two
 		let transport =
@@ -94,8 +97,11 @@ pub fn init(
 					},
 				}
 			});
-		// wrap transport for DNS lookups
-		TokioDnsConfig::system(transport)?.boxed()
+		let cfg = ResolverConfig::google();
+
+		let options = ResolverOpts::default();
+		// let do_steps = || -> Result<(), Error> {
+		TokioDnsConfig::custom(transport, cfg, options)?.boxed()
 	};
 
 	// Initialize Network Behaviour Struct

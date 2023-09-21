@@ -1,9 +1,10 @@
 [package]
-name = "avail-light"
+name = "avail_light"
 version = "1.6.0"
 authors = ["Avail Team"]
 default-run = "avail-light"
 edition = "2021"
+
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [[bin]]
@@ -15,6 +16,11 @@ bench = false
 name = "avail-light"
 test = false
 bench = false
+
+
+[lib]
+name = "avail_light"
+crate-type = ["staticlib","dylib"]
 
 [dependencies]
 # Internal deps
@@ -80,6 +86,7 @@ opentelemetry_sdk = { version = "0.20.0", features = ["metrics", "rt-tokio"] }
 
 # Override 
 bindgen = { version = "0.63.0", default-features = false, features = ["runtime"] }
+async-ffi = "0.5.0"
 
 [features]
 network-analysis = []

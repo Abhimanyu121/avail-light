@@ -1,3 +1,4 @@
+pub mod android_jni;
 pub mod api;
 pub mod app_client;
 pub mod consts;
