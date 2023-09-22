@@ -262,19 +262,20 @@ pub async fn run(
 	let state = Arc::new(Mutex::new(State::default()));
 	state.lock().unwrap().latest = block_header.number;
 	let sync_end_block = block_header.number.saturating_sub(1);
+	if need_server {
+		// Spawn tokio task which runs one http server for handling RPC
+		let server = api::server::Server {
+			db: db.clone(),
+			cfg: cfg.clone(),
+			state: state.clone(),
+			version: format!("v{}", clap::crate_version!()),
+			network_version: EXPECTED_NETWORK_VERSION.to_string(),
+			node,
+			node_client: rpc_client.clone(),
+		};
 
-	// Spawn tokio task which runs one http server for handling RPC
-	let server = api::server::Server {
-		db: db.clone(),
-		cfg: cfg.clone(),
-		state: state.clone(),
-		version: format!("v{}", clap::crate_version!()),
-		network_version: EXPECTED_NETWORK_VERSION.to_string(),
-		node,
-		node_client: rpc_client.clone(),
-	};
-
-	tokio::task::spawn(server.run());
+		tokio::task::spawn(server.run());
+	}
 
 	let block_tx = if let Mode::AppClient(app_id) = Mode::from(cfg.app_id) {
 		// communication channels being established for talking to
