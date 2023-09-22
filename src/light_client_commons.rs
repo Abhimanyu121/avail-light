@@ -103,7 +103,6 @@ pub async fn run(
 	if let Some(error) = parse_error {
 		warn!("Using default log level: {}", error);
 	}
-	// panic!("{}", cfg.avail_path);
 
 	let db = init_db(&cfg.avail_path).context("Cannot initialize database")?;
 
@@ -144,6 +143,7 @@ pub async fn run(
 			}
 		}
 	});
+
 	let (network_client, network_event_loop) = super::network::init(
 		(&cfg).into(),
 		network_stats_sender,

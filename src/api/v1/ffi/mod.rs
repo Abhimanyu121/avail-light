@@ -1,5 +1,6 @@
 pub mod types;
-use crate::types::{Mode, State};
+use crate::types::{Mode, RuntimeConfig, State};
+use anyhow::anyhow;
 
 use super::common::types::{
 	ClientResponse, ConfidenceResponse, ExtrinsicsDataResponse, LatestBlockResponse,
@@ -7,44 +8,70 @@ use super::common::types::{
 use crate::api::v1::common;
 use crate::api::v1::common::types::AppDataQuery;
 use crate::api::v1::ffi::types::{FfiSafeAppDataQuery, FfiSafeConfidenceResponse, FfiSafeStatus};
+use crate::light_client_commons::{run, DB, STATE};
 use rocksdb::DB;
 use std::{
 	ffi::CString,
-	ptr::{self},
 	sync::{Arc, Mutex},
 };
-pub struct EmbedState {
-	db: Arc<DB>,
-	state: Arc<Mutex<State>>,
-}
-impl EmbedState {
-	pub fn new(state: Arc<Mutex<State>>, db: Arc<DB>) -> Self {
-		return Self { state, db };
+use tokio::sync::mpsc::channel;
+use tracing::error;
+
+fn get_state() -> Arc<Mutex<State>> {
+	match unsafe { STATE.clone() } {
+		Some(state) => return state,
+		_ => {
+			panic!("Client not initialized")
+		},
 	}
-	pub fn from_ptr(embed_state: *const EmbedState) -> &'static mut EmbedState {
-		let r = unsafe {
-			let mut p = ptr::NonNull::new(embed_state as *mut EmbedState).unwrap();
-			p.as_mut()
-		};
-		return r;
-	}
-	fn get_state(&self) -> Arc<Mutex<State>> {
-		return self.state.clone();
-	}
-	fn get_db(&self) -> Arc<DB> {
-		return self.db.clone();
-	}
-}
-fn get_state(embed_state_ref: *const EmbedState) -> Arc<Mutex<State>> {
-	let embed_sate: &'static mut EmbedState = EmbedState::from_ptr(embed_state_ref);
-	let state: Arc<Mutex<State>> = EmbedState::get_state(embed_sate);
-	return state;
 }
 
-fn get_db(embed_state_ref: *const EmbedState) -> Arc<DB> {
-	let embed_sate: &'static mut EmbedState = EmbedState::from_ptr(embed_state_ref);
-	let db: Arc<DB> = EmbedState::get_db(embed_sate);
-	return db;
+fn get_db() -> Arc<DB> {
+	match unsafe { DB.clone() } {
+		Some(db) => return db,
+		_ => {
+			panic!("Client not initialized")
+		},
+	}
+}
+#[allow(non_snake_case)]
+#[no_mangle]
+#[tokio::main]
+pub async unsafe extern "C" fn start_light_node() -> bool {
+	let mut cfg: RuntimeConfig = RuntimeConfig::default();
+	cfg.log_level = String::from("info");
+	cfg.http_server_host = String::from("10.0.2.2");
+	cfg.http_server_port = (7000, 8080);
+
+	cfg.full_node_ws = [String::from("ws://10.0.2.2:9944")].to_vec();
+	cfg.app_id = Some(0);
+	cfg.confidence = 92.0;
+	cfg.avail_path =
+		String::from("/data/user/0/com.example.avail_light_app/app_flutter/avail_path");
+	cfg.bootstraps = [(
+		String::from("12D3KooWMm1c4pzeLPGkkCJMAgFbsfQ8xmVDusg272icWsaNHWzN"),
+		("/ip4/10.0.2.2/tcp/37000").parse().unwrap(),
+	)]
+	.to_vec();
+	let (error_sender, mut error_receiver) = channel::<anyhow::Error>(1);
+
+	let res = run(error_sender, cfg, false).await;
+
+	if let Err(error) = res {
+		error!("{error}");
+	} else {
+		let (state, db): (Arc<Mutex<State>>, Arc<DB>) = res.unwrap();
+		STATE = Some(state);
+		DB = Some(db);
+		return true;
+	};
+
+	let error = match error_receiver.recv().await {
+		Some(error) => error,
+		None => anyhow!("Failed to receive error message"),
+	};
+	panic!("Error: {}", error);
+	return false;
 }
 
 #[no_mangle]
@@ -53,12 +80,9 @@ pub extern "C" fn c_mode(app_id: u32) -> ClientResponse<Mode> {
 }
 #[allow(improper_ctypes_definitions)]
 #[no_mangle]
-pub extern "C" fn c_confidence(
-	block_number: u32,
-	embed_state: *const EmbedState,
-) -> ClientResponse<FfiSafeConfidenceResponse> {
-	let db: Arc<DB> = get_db(embed_state);
-	let state: Arc<Mutex<State>> = get_state(embed_state);
+pub extern "C" fn c_confidence(block_number: u32) -> ClientResponse<FfiSafeConfidenceResponse> {
+	let db: Arc<DB> = get_db();
+	let state: Arc<Mutex<State>> = get_state();
 
 	let client_response: ClientResponse<ConfidenceResponse> =
 		common::confidence(block_number, db, state);
@@ -88,12 +112,9 @@ pub extern "C" fn c_confidence(
 }
 
 #[no_mangle]
-pub extern "C" fn c_status(
-	app_id: u32,
-	embed_state: *const EmbedState,
-) -> ClientResponse<FfiSafeStatus> {
-	let db: Arc<DB> = get_db(embed_state);
-	let state: Arc<Mutex<State>> = get_state(embed_state);
+pub extern "C" fn c_status(app_id: u32) -> ClientResponse<FfiSafeStatus> {
+	let db: Arc<DB> = get_db();
+	let state: Arc<Mutex<State>> = get_state();
 	let client_response = common::status(Some(app_id), state, db);
 	match client_response {
 		ClientResponse::Normal(res) => {
@@ -120,11 +141,18 @@ pub extern "C" fn c_status(
 }
 
 #[no_mangle]
-pub extern "C" fn c_latest_block(
-	embed_state: *const EmbedState,
-) -> ClientResponse<LatestBlockResponse> {
-	let state: Arc<Mutex<State>> = get_state(embed_state);
-	return common::latest_block(state);
+pub extern "C" fn c_latest_block() -> ClientResponse<LatestBlockResponse> {
+	let state: Arc<Mutex<State>> = get_state();
+	let latest_block = common::latest_block(state);
+	match latest_block {
+		ClientResponse::Normal(res) => {
+			panic!("res {}", res.latest_block)
+		},
+		ClientResponse::NotFound => panic!("Not found"),
+		ClientResponse::NotFinalized => panic!("NotFinalized"),
+		ClientResponse::InProcess => panic!("InProcess"),
+		ClientResponse::Error(err) => panic!("err {}", err),
+	}
 }
 #[allow(improper_ctypes_definitions)]
 #[no_mangle]
@@ -132,10 +160,9 @@ pub extern "C" fn c_appdata(
 	block_num: u32,
 	query: FfiSafeAppDataQuery,
 	app_id: u32,
-	embed_state: *const EmbedState,
 ) -> ClientResponse<ExtrinsicsDataResponse> {
-	let db: Arc<DB> = get_db(embed_state);
-	let state: Arc<Mutex<State>> = get_state(embed_state);
+	let db: Arc<DB> = get_db();
+	let state: Arc<Mutex<State>> = get_state();
 	return common::appdata(
 		block_num,
 		AppDataQuery {

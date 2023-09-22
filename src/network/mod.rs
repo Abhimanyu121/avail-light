@@ -1,5 +1,3 @@
-use std::fmt::Error;
-
 use anyhow::{Context, Result};
 use event_loop::EventLoop;
 use futures::future::Either;
