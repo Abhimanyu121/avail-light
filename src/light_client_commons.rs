@@ -1,6 +1,10 @@
 use anyhow::{anyhow, Context, Result};
+use async_std::stream::StreamExt;
 use avail_core::AppId;
+
 use avail_subxt::primitives::Header;
+use libp2p::multiaddr::Protocol;
+use libp2p::{Multiaddr, PeerId};
 use std::{
 	net::Ipv4Addr,
 	str::FromStr,
@@ -9,15 +13,14 @@ use std::{
 };
 use tracing::{error, info, trace, warn, Level};
 
-use async_std::stream::StreamExt;
-use libp2p::multiaddr::Protocol;
-use libp2p::{Multiaddr, PeerId};
-
 use super::telemetry::{self, MetricValue, NetworkDumpEvent};
 use super::{
 	consts::EXPECTED_NETWORK_VERSION,
 	data::store_last_full_node_ws_in_db,
 	types::{Mode, RuntimeConfig, State},
+};
+use crate::{
+	api, app_client, data, light_client, network, rpc, subscriptions, sync_client, sync_finality,
 };
 use crate::{
 	api::server::Server,
@@ -97,7 +100,8 @@ pub async fn run(
 		tracing::subscriber::set_global_default(default_subscriber(log_level))
 			.expect("global default subscriber is set")
 	}
-
+	let version = clap::crate_version!();
+	info!("Running Avail light client version: {version}");
 	info!("Using config: {cfg:?}");
 
 	if let Some(error) = parse_error {
@@ -113,10 +117,24 @@ pub async fn run(
 		info!("Fat client mode");
 	}
 
-	let (id_keys, peer_id) = super::network::keypair((&cfg).into())?;
+	let (id_keys, peer_id) = network::keypair((&cfg).into())?;
+
+	// Check if bootstrap nodes were provided
+	let bootstrap_nodes = cfg
+		.bootstraps
+		.iter()
+		.map(|(a, b)| Ok((PeerId::from_str(a)?, b.clone())))
+		.collect::<Result<Vec<(PeerId, Multiaddr)>>>()
+		.context("Failed to parse bootstrap nodes")?;
+
+	let mut client_role = "lightnode".to_string();
+	// If not bootstrap nodes provided, the client is the bootstrap
+	if bootstrap_nodes.is_empty() {
+		client_role = "bootnode".to_string();
+	}
 
 	let ot_metrics = Arc::new(
-		telemetry::otlp::initialize(cfg.ot_collector_endpoint.clone(), peer_id)
+		telemetry::otlp::initialize(cfg.ot_collector_endpoint.clone(), peer_id, client_role)
 			.context("Unable to initialize OpenTelemetry service")?,
 	);
 
@@ -129,8 +147,14 @@ pub async fn run(
 		while let Some(network_dump_event) = network_stats_receiver.recv().await {
 			// Set multiaddress for metric dispatch
 			if !network_dump_event.current_multiaddress.is_empty() {
-				*network_stats_metrics.multiaddress.write().unwrap() =
-					network_dump_event.current_multiaddress;
+				*network_stats_metrics
+					.multiaddress
+					.write()
+					.expect("unable to write metric multiaddress") = network_dump_event.current_multiaddress;
+				*network_stats_metrics
+					.ip
+					.write()
+					.expect("unable to write metric ip address") = network_dump_event.current_ip;
 			}
 
 			let number = network_dump_event
@@ -144,7 +168,7 @@ pub async fn run(
 		}
 	});
 
-	let (network_client, network_event_loop) = super::network::init(
+	let (network_client, network_event_loop) = network::init(
 		(&cfg).into(),
 		network_stats_sender,
 		cfg.dht_parallelization_limit,
@@ -173,14 +197,6 @@ pub async fn run(
 		.await
 		.context("Listening on UDP not to fail.")?;
 
-	// Check if bootstrap nodes were provided
-	let bootstrap_nodes = cfg
-		.bootstraps
-		.iter()
-		.map(|(a, b)| Ok((PeerId::from_str(a)?, b.clone())))
-		.collect::<Result<Vec<(PeerId, Multiaddr)>>>()
-		.context("Failed to parse bootstrap nodes")?;
-
 	// If the client is the first one on the network, and no bootstrap nodes, then wait for the
 	// second client to establish connection and use it as bootstrap.
 	// DHT requires node to be bootstrapped in order for Kademlia to be able to insert new records.
@@ -190,7 +206,7 @@ pub async fn run(
 			.events_stream()
 			.await
 			.find_map(|e| match e {
-				super::network::Event::ConnectionEstablished { peer_id, endpoint } => {
+				network::Event::ConnectionEstablished { peer_id, endpoint } => {
 					if endpoint.is_listener() {
 						Some((peer_id, endpoint.get_remote_address().clone()))
 					} else {
@@ -201,7 +217,6 @@ pub async fn run(
 			// hang in there, until someone dials us
 			.await
 			.context("Connection is not established")?;
-
 		vec![node]
 	} else {
 		bootstrap_nodes
@@ -219,9 +234,10 @@ pub async fn run(
 	let public_params_hash = hex::encode(sp_core::blake2_128(&raw_pp));
 	let public_params_len = hex::encode(raw_pp).len();
 	trace!("Public params ({public_params_len}): hash: {public_params_hash}");
-	let last_full_node_ws = super::data::get_last_full_node_ws_from_db(db.clone())?;
 
-	let (rpc_client, node) = super::rpc::connect_to_the_full_node(
+	let last_full_node_ws = data::get_last_full_node_ws_from_db(db.clone())?;
+
+	let (rpc_client, node) = rpc::connect_to_the_full_node(
 		&cfg.full_node_ws,
 		last_full_node_ws,
 		EXPECTED_NETWORK_VERSION,
@@ -231,7 +247,7 @@ pub async fn run(
 	store_last_full_node_ws_in_db(db.clone(), node.host.clone())?;
 
 	info!("Genesis hash: {:?}", node.genesis_hash);
-	if let Some(stored_genesis_hash) = super::data::get_genesis_hash(db.clone())? {
+	if let Some(stored_genesis_hash) = data::get_genesis_hash(db.clone())? {
 		if !node.genesis_hash.eq(&stored_genesis_hash) {
 			Err(anyhow!(
 				"Genesis hash doesn't match the stored one! Clear the db or change nodes."
@@ -239,40 +255,35 @@ pub async fn run(
 		}
 	} else {
 		info!("No genesis hash is found in the db, storing the new hash now.");
-		super::data::store_genesis_hash(db.clone(), node.genesis_hash)?;
+		data::store_genesis_hash(db.clone(), node.genesis_hash)?;
 	}
 
-	let block_header = super::rpc::get_chain_head_header(&rpc_client)
+	let block_header = rpc::get_chain_head_header(&rpc_client)
 		.await
 		.context(format!("Failed to get chain header from {rpc_client:?}"))?;
 
 	let state = Arc::new(Mutex::new(State::default()));
 	state.lock().unwrap().latest = block_header.number;
-	let sync_end_block = block_header.number - 1;
-	unsafe {
-		STATE = Some(state.clone());
-		DB = Some(db.clone());
-	}
+	let sync_end_block = block_header.number.saturating_sub(1);
 
-	if need_server {
-		// Spawn tokio task which runs one http server for handling RPC
-		let server: Server = super::api::server::Server {
-			db: db.clone(),
-			cfg: cfg.clone(),
-			state: state.clone(),
-			version: format!("v{}", clap::crate_version!()),
-			network_version: EXPECTED_NETWORK_VERSION.to_string(),
-			node,
-		};
+	// Spawn tokio task which runs one http server for handling RPC
+	let server = api::server::Server {
+		db: db.clone(),
+		cfg: cfg.clone(),
+		state: state.clone(),
+		version: format!("v{}", clap::crate_version!()),
+		network_version: EXPECTED_NETWORK_VERSION.to_string(),
+		node,
+		node_client: rpc_client.clone(),
+	};
 
-		tokio::task::spawn(server.run());
-	}
+	tokio::task::spawn(server.run());
 
 	let block_tx = if let Mode::AppClient(app_id) = Mode::from(cfg.app_id) {
 		// communication channels being established for talking to
 		// libp2p backed application client
-		let (block_tx, block_rx) = channel::<super::types::BlockVerified>(1 << 7);
-		tokio::task::spawn(super::app_client::run(
+		let (block_tx, block_rx) = channel::<types::BlockVerified>(1 << 7);
+		tokio::task::spawn(app_client::run(
 			(&cfg).into(),
 			db.clone(),
 			network_client.clone(),
@@ -288,12 +299,11 @@ pub async fn run(
 		None
 	};
 
-	let sync_client =
-		super::sync_client::new(db.clone(), network_client.clone(), rpc_client.clone());
+	let sync_client = sync_client::new(db.clone(), network_client.clone(), rpc_client.clone());
 
 	if let Some(sync_start_block) = cfg.sync_start_block {
 		state.lock().unwrap().set_synced(false);
-		tokio::task::spawn(super::sync_client::run(
+		tokio::task::spawn(sync_client::run(
 			sync_client,
 			(&cfg).into(),
 			sync_start_block,
@@ -304,8 +314,8 @@ pub async fn run(
 		));
 	}
 
-	let sync_finality = super::sync_finality::new(db.clone(), rpc_client.clone());
-	tokio::task::spawn(super::sync_finality::run(
+	let sync_finality = sync_finality::new(db.clone(), rpc_client.clone());
+	tokio::task::spawn(sync_finality::run(
 		sync_finality,
 		error_sender.clone(),
 		state.clone(),
@@ -313,7 +323,7 @@ pub async fn run(
 
 	let (message_tx, message_rx) = channel::<(Header, Instant)>(128);
 
-	tokio::task::spawn(super::subscriptions::finalized_headers(
+	tokio::task::spawn(subscriptions::finalized_headers(
 		rpc_client.clone(),
 		message_tx,
 		error_sender.clone(),
@@ -321,15 +331,15 @@ pub async fn run(
 		db.clone(),
 	));
 
-	let light_client = super::light_client::new(db.clone(), network_client, rpc_client);
+	let light_client = light_client::new(db.clone(), network_client, rpc_client);
 
-	let lc_channels = super::light_client::Channels {
+	let lc_channels = light_client::Channels {
 		block_sender: block_tx,
 		header_receiver: message_rx,
 		error_sender,
 	};
 
-	tokio::task::spawn(super::light_client::run(
+	tokio::task::spawn(light_client::run(
 		light_client,
 		(&cfg).into(),
 		pp,
@@ -338,5 +348,5 @@ pub async fn run(
 		lc_channels,
 	));
 
-	return Ok((state.clone(), db.clone()));
+	return Ok((state, db));
 }
