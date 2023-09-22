@@ -19,12 +19,9 @@ use super::{
 	data::store_last_full_node_ws_in_db,
 	types::{Mode, RuntimeConfig, State},
 };
+use crate::consts::{APP_DATA_CF, BLOCK_HEADER_CF, CONFIDENCE_FACTOR_CF, STATE_CF};
 use crate::{
 	api, app_client, data, light_client, network, rpc, subscriptions, sync_client, sync_finality,
-};
-use crate::{
-	api::server::Server,
-	consts::{APP_DATA_CF, BLOCK_HEADER_CF, CONFIDENCE_FACTOR_CF, STATE_CF},
 };
 use crate::{telemetry::Metrics, types};
 use rocksdb::{ColumnFamilyDescriptor, Options, DB};
